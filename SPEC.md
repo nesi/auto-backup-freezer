@@ -79,13 +79,10 @@ A CLI a researcher runs once (and re-runs to change settings):
 - Whether/when to prune metadata entries whose source folders no longer exist on `nobackup`.
 
 ### Out of scope, for now
-
-A generic tool accessable to all researchers, put in `opt-nesi-bin`.
-
-Tool might push increased use of archive, Freezer's actual write throughput is bounded by a small number of physical tape heads, we would want to make sure that this tool does not interfere with regular usage.
-
-- **Slurm reservation.** Since every Tool 1 run is already a Slurm job by construction (via `scrontab`), this may be closer to configuration than new infrastructure: have Tool 2 set a reservation on the `#SCRON` directive with a hard cap (e.g. 2 running at once), and Slurm's own scheduler enforces the limit across every project using it no bespoke queue to build or own.
-- **Semaphore.** A small, fixed number of lock files in a well-known shared location (one per available Freezer head). Tool 1 tries to `flock` one before writing, if none are free, it waits or defers to the next scheduled run. Simpler to reason about than a Slurm partition, but it's infrastructure someone still has to place and maintain, and doesn't get fairness/scheduling for free the way Slurm does.
-- **Jitter.** Tool 2 assigns each project a randomised offset within the scheduling window, spreading start times out to reduce collision odds.
+- A generic tool accessable to all researchers, put in `opt-nesi-bin`.
+- Tool might push increased use of archive, Freezer's actual write throughput is bounded by a small number of physical tape heads, we would want to make sure that this tool does not interfere with regular usage.
+  - **Slurm reservation.** Since every Tool 1 run is already a Slurm job by construction (via `scrontab`), this may be closer to configuration than new infrastructure: have Tool 2 set a reservation on the `#SCRON` directive with a hard cap (e.g. 2 running at once), and Slurm's own scheduler enforces the limit across every project using it no bespoke queue to build or own.
+  - **Semaphore.** A small, fixed number of lock files in a well-known shared location (one per available Freezer head). Tool 1 tries to `flock` one before writing, if none are free, it waits or defers to the next scheduled run. Simpler to reason about than a Slurm partition, but it's infrastructure someone still has to place and maintain, and doesn't get fairness/scheduling for free the way Slurm does.
+  - **Jitter.** Tool 2 assigns each project a randomised offset within the scheduling window, spreading start times out to reduce collision odds.
 - Automatic deletion of data from Freezer after the 2-year retention period.
 - Centralised logging (loki/alloy), best handled seperately to tool IMO.
