@@ -1,12 +1,12 @@
 # Implementation Plan
 
-
 ## Phase 0 - Unresolved
 
 - [ ] Decide copy mechanism S3 API vs Globus
 - [ ] Decide metadata format
 - [ ] Agree `_final` convention with researchers
 - [ ] Confirm `775` perms on target `nobackup` dir
+- [ ] names (`archive-tool` and `runner-archive` (runner first to avoid tab complete confusion))
 
 ## Phase 1 - Set up test data
 
