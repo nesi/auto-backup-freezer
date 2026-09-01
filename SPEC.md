@@ -56,6 +56,9 @@ A CLI a researcher runs once (and re-runs to change settings):
 2. **Validate** before installing anything: confirm the folder exists and is writable, confirm Freezer credentials/access work (e.g. a lightweight `s3cmd ls` against the target bucket), confirm `775`/group permissions look sane and warn if not.
 3. **Install or update** a `scrontab` entry invoking Tool 1 with these parameters. The entry is tagged with a marker comment so Tool 2 can find and replace its own prior line on re-run, without touching any other entries in the researcher's `scrontab` table. Editing is always read-modify-write against the existing table (`scrontab -l` / `scrontab -e`), never a blind overwrite.
 4. Print a summary
+5. **Status command** - a way to check current archive state (what's been archived, what's pending, when the last run happened) without reading the metadata list by hand.
+6. **`--dry-run`** - show what a real run would do (files that would be archived, `scrontab` entry that would be installed/changed) without writing anything.
+7. If a researcher needs to delete an archive, they do it themselves via the regular `s3cmd`.
 
 ## Requirements
 
@@ -68,15 +71,17 @@ A CLI a researcher runs once (and re-runs to change settings):
 - **Retention:** archived data is kept on tape for 2 years; the metadata file records archive dates so automatic deletion after that period could be added later without a data audit.
 - **Scheduling:** all unattended runs go through `scrontab`, not regular cron, because regular cron isn't available to users.
 - If an already-archived file is later modified, detected drift (recorded state vs. current file) is a log warning at run-time, not a stored metadata entry.
+- The Freezer-side copy is otherwise left alone unless the researcher opts in - a `--overwrite` flag should make explicit whether a changed source file gets re-archived or just logged.
 
 ### Open questions / risks
 
-- **Multiple researchers, one project.** The design assumes exactly one person sets up, group by project maybe?
+- **Multiple researchers, one project.** The design assumes exactly one person sets up, group by project maybe? Related can the `scrontab` entry be scoped per-project. If not may have to look into non crontab scheduling.
 - **No dead-man's-switch.** If Tool 1 stops running entirely `scrontab` entry wiped.
 - **Copy mechanism**: whether the tar-and-write-to-Freezer step uses the S3 API (`s3cmd`/similar) or Globus.
 - **What "visibility into what's archived" should actually be**: is the metadata file enough, or does this need a log, an email, or a small "check status" command in Tool 1/Tool 2 rather than expecting researchers to read a manifest directly?
-- **Metadata format**  
+- **Metadata format** - what fields does an entry actually need? At minimum: source path, archive/tar name, archive date, size, checksum, mtime. Consider adopting **[BagIt](https://en.wikipedia.org/wiki/BagIt)** as the on-disk metadata standard rather than a bespoke format.
 - Whether/when to prune metadata entries whose source folders no longer exist on `nobackup`.
+- **`nobackup` auto-delete mechanics** - Uses atime. what frequency should tool1 uses to keep pending files alive, touching one period out may be too close maybe touching 3 out for safety.
 
 ### Out of scope, for now
 - A generic tool accessable to all researchers, put in `opt-nesi-bin`.
@@ -85,4 +90,5 @@ A CLI a researcher runs once (and re-runs to change settings):
   - **Semaphore.** A small, fixed number of lock files in a well-known shared location (one per available Freezer head). Tool 1 tries to `flock` one before writing, if none are free, it waits or defers to the next scheduled run. Simpler to reason about than a Slurm partition, but it's infrastructure someone still has to place and maintain, and doesn't get fairness/scheduling for free the way Slurm does.
   - **Jitter.** Tool 2 assigns each project a randomised offset within the scheduling window, spreading start times out to reduce collision odds.
 - Automatic deletion of data from Freezer after the 2-year retention period.
+- A `--sync` flag on Tool 1 (mirror deletions from `nobackup` to Freezer).
 - Centralised logging (loki/alloy), best handled seperately to tool IMO.
