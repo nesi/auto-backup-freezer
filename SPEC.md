@@ -75,12 +75,16 @@ A CLI a researcher runs once (and re-runs to change settings):
 
 ### Open questions / risks
 
-- **Multiple researchers, one project.** The design assumes exactly one person sets up, group by project maybe? Related can the `scrontab` entry be scoped per-project. If not may have to look into non crontab scheduling.
-- **No dead-man's-switch.** If Tool 1 stops running entirely `scrontab` entry wiped.
+- **Multiple researchers, one project.** Current design assumes exactly one person sets up, `scrontab`, config changes must be done by same user (note, pattern can specify across whole project).
+  If same config needs to be editable by whole project (questionable), there are options.
+  - Used user-systemd, while still has to run as user, those files can be given group permissions.(messy)
+  - File based config. Scron would read the config at execute time. (still requires someone to set up their own crontab, messy)
+  - Globus compute can maybe do something?
+- **No dead-man's-switch.** If Tool 1 stops mid run, what happens?
 - **Copy mechanism**: whether the tar-and-write-to-Freezer step uses the S3 API (`s3cmd`/similar) or Globus.
 - **What "visibility into what's archived" should actually be**: is the metadata file enough, or does this need a log, an email, or a small "check status" command in Tool 1/Tool 2 rather than expecting researchers to read a manifest directly?
 - **Metadata format** - what fields does an entry actually need? At minimum: source path, archive/tar name, archive date, size, checksum, mtime. Consider adopting **[BagIt](https://en.wikipedia.org/wiki/BagIt)** as the on-disk metadata standard rather than a bespoke format.
-- Whether/when to prune metadata entries whose source folders no longer exist on `nobackup`.
+- How should discrepencies between disk and metadata be treated? I'd suggest flags. Default behavor `--safe` = no delete, no update, `--overwrite` = no delete, allow update, `--sync` allow overwrite and delete. 
 - **`nobackup` auto-delete mechanics** - Uses atime. what frequency should tool1 uses to keep pending files alive, touching one period out may be too close maybe touching 3 out for safety.
 
 ### Out of scope, for now
