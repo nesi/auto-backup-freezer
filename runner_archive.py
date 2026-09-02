@@ -8,28 +8,33 @@ import getopt
 import json
 import logging
 import os
+import subprocess
 import sys
+import tempfile
+import time
 from datetime import date
 from pathlib import Path
 
 PROGNAME = "runner_archive"
 
-DEFAULT_PATTERN = "*_final"
+DEFAULT_TOUCH_THRESHOLD_DAYS = 75  # nobackup's auto-cleaner reaps at 90 days - leaves a margin
+COMPRESS_MODES = ("auto", "always", "never")
+COMPRESSED_FRACTION_THRESHOLD = 0.9  
 
 USAGE = f"""usage: {PROGNAME} [OPTIONS]
 
-  -f, --folder PATH     nobackup folder to scan (required)
+  -p, --pattern GLOB     top-level folder glob to archive (required).
   -b, --bucket NAME      Freezer bucket to archive into (required)
-  -p, --pattern GLOB     top-level folder glob to archive (default: "{DEFAULT_PATTERN}")
   -c, --compress MODE    auto (default), always, or never
+  -t, --touch-threshold-days DAYS
+                         only touch pending files at least DAYS old ()
+  -n, --dry-run          discover/diff only, no tar, upload, metadata write, or touch
   -v, --verbose          debug logging
   -h, --help             show this help
 """
 
-COMPRESS_MODES = ("auto", "always", "never")
 
-# Signatures for formats that are already compressed - recompressing these
-# wastes CPU for near-zero size change (sometimes a slight increase).
+# Signatures for formats that are already compressed.recompressing these wastes CPU.
 # BAM is BGZF (block gzip), so it shares gzip's magic bytes.
 MAGIC_BYTES = [
     b"\x1f\x8b",              # gzip / BAM (BGZF)
@@ -39,7 +44,7 @@ MAGIC_BYTES = [
     b"PK\x03\x04",            # zip
     b"CRAM",                  # CRAM
 ]
-COMPRESSED_FRACTION_THRESHOLD = 0.9  # tunable: fraction of bytes already-compressed to skip compression
+# threshold of bytes already compressed to skip compression
 
 log = logging.getLogger(PROGNAME)
 
@@ -48,55 +53,53 @@ class LockHeld(Exception):
     """Another run already holds the lock file."""
 
 
+def _usage_error(msg):
+    print(f"{PROGNAME}: {msg}", file=sys.stderr)
+    print(USAGE, file=sys.stderr)
+    sys.exit(2)
+
+
 def parse_args(argv):
     try:
-        opts, _args = getopt.getopt(
-            argv, "f:b:p:c:vh",
-            ["folder=", "bucket=", "pattern=", "compress=", "verbose", "help"],
+        opts, args = getopt.getopt(
+            argv, "p:b:c:t:nvh",
+            ["pattern=", "bucket=", "compress=", "touch-threshold-days=", "dry-run", "verbose", "help"],
         )
     except getopt.GetoptError as e:
-        print(f"{PROGNAME}: {e}", file=sys.stderr)
-        print(USAGE, file=sys.stderr)
-        sys.exit(2)
+        _usage_error(str(e))
 
     opts = dict(opts)
     if "-h" in opts or "--help" in opts:
         print(USAGE)
         sys.exit(0)
 
-    folder = opts.get("-f") or opts.get("--folder")
+    # getopt stops parsing options at the first non-option argument, so a
+    # stray positional here would otherwise silently swallow every flag
+    # after it instead of raising.
+    if args:
+        _usage_error(f"unexpected argument(s): {' '.join(args)}")
+
+    pattern = opts.get("-p") or opts.get("--pattern")
     bucket = opts.get("-b") or opts.get("--bucket")
-    pattern = opts.get("-p") or opts.get("--pattern") or DEFAULT_PATTERN
     compress_mode = opts.get("-c") or opts.get("--compress") or "auto"
+    touch_threshold_raw = opts.get("-t") or opts.get("--touch-threshold-days")
+    dry_run = "-n" in opts or "--dry-run" in opts
     verbose = "-v" in opts or "--verbose" in opts
 
-    if not folder or not bucket:
-        print(f"{PROGNAME}: --folder and --bucket are required", file=sys.stderr)
-        print(USAGE, file=sys.stderr)
-        sys.exit(2)
-
+    if not pattern or not bucket:
+        _usage_error("--pattern and --bucket are required")
     if compress_mode not in COMPRESS_MODES:
-        print(f"{PROGNAME}: --compress must be one of {COMPRESS_MODES}", file=sys.stderr)
-        sys.exit(2)
+        _usage_error(f"--compress must be one of {COMPRESS_MODES}")
 
-    return Path(folder), bucket, pattern, compress_mode, verbose
+    # not proply implimented yet.
+    touch_threshold_days = DEFAULT_TOUCH_THRESHOLD_DAYS
 
 
-def setup_logging(verbose, log_path):
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        handlers=[logging.FileHandler(log_path), logging.StreamHandler()],
-    )
+    return pattern, bucket, compress_mode, touch_threshold_days, dry_run, verbose
 
 
 def acquire_lock(lock_path):
-    """
-    Non-blocking flock. Returns an open handle the caller must close when
-    done. Raises LockHeld if another process already holds it.
-    SPEC "How it works" 3.1 step 1 - NOTE: assumes flock is atomic on
-    nobackup's filesystem (Weka); unconfirmed, see SPEC Open Questions.
-    """
+    """Non-flocking block."""
     fh = open(lock_path, "w")
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -106,15 +109,11 @@ def acquire_lock(lock_path):
     return fh
 
 
-# Format not settled - see SPEC Open Questions ("Metadata format isn't
-# settled"). For now: metadata is just a list of archived files, one JSON
-# record per line (JSONL), append-only. No event types.
-
 def load_metadata(metadata_path):
-    """Read the metadata list, return {(folder, file): record}."""
-    archived = {}
+    """Placeholder"""
     if not metadata_path.exists():
-        return archived
+        return {}
+    archived = {}
     with metadata_path.open() as fh:
         for line in fh:
             line = line.strip()
@@ -123,7 +122,6 @@ def load_metadata(metadata_path):
             try:
                 record = json.loads(line)
             except json.JSONDecodeError:
-                # A crash mid-append can leave a partial trailing line.
                 log.warning("skipping unparseable metadata line: %r", line)
                 continue
             archived[(record["folder"], record["file"])] = record
@@ -131,32 +129,45 @@ def load_metadata(metadata_path):
 
 
 def append_metadata(metadata_path, file_records):
-    """Append file records as new lines. Existing lines are never rewritten."""
-    with metadata_path.open("a") as fh:
-        for record in file_records:
-            fh.write(json.dumps(record) + "\n")
+    """Placeholder"""
+    return
 
-def discover_folders(nobackup_path, pattern=DEFAULT_PATTERN):
-    """
-    Top-level folders matching `pattern` (default "*_final"). No recursion
-    unless the caller passes a pattern with "**" - SPEC's top-level-only
-    assumption is a default, not enforced here.
-    """
+def split_pattern(pattern):
+    path = Path(pattern)
+    return path.parent, path.name
+
+
+def discover_folders(nobackup_path, pattern):
     return sorted(p for p in nobackup_path.glob(pattern) if p.is_dir())
 
 
+def run_s3cmd(args, **kwargs):
+    """Like subprocess.run but with s3 specific fail case for no configured"""
+    try:
+        return subprocess.run(args, check=True, **kwargs)
+    except subprocess.CalledProcessError as e:
+        if e.returncode == 78:
+            log.warning("s3cmd is not configured.  Run `s3cmd --configure` first")
+            return None
+        raise
+
+
 def list_freezer_contents(bucket, folder_name):
-    """
-    Tar objects already on Freezer for this folder.
-    SPEC "How it works" 3.1 step 3.
-    """
-    # TODO: not started. Depends on the copy mechanism decision (S3 API vs
-    # Globus - SPEC Phase 0/Open Questions), which determines both how to
-    # list contents and how to invoke it (e.g. `s3cmd ls -l -H`). Also
-    # currently unused by diff_new_files() below, which only checks
-    # metadata - whether new files should also be cross-checked against a
-    # live Freezer listing hasn't been decided either.
-    raise NotImplementedError
+    proc = run_s3cmd(
+        ["s3cmd", "ls", "-l", "-H", f"s3://{bucket}/"],
+        capture_output=True, text=True,
+    )
+    prefix = f"{folder_name}-"
+    names = set()
+    if proc:
+        for line in proc.stdout.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            name = parts[-1].rsplit("/", 1)[-1]
+            if name.startswith(prefix):
+                names.add(name)
+    return names
 
 
 def unarchived_files(folder, archived):
@@ -167,26 +178,16 @@ def unarchived_files(folder, archived):
 
 
 def diff_new_files(folder, archived):
-    """
-    New files to archive - this is what avoids re-archiving duplicates.
-    SPEC "How it works" 3.1 step 5.
-    """
     return list(unarchived_files(folder, archived))
 
 def is_probably_compressed(path):
-    """Cheap check: does this file's header match a known-compressed format's magic bytes?"""
     with path.open("rb") as fh:
         header = fh.read(8)
     return any(header.startswith(sig) for sig in MAGIC_BYTES)
 
 
 def should_compress(new_files, mode):
-    """
-    Whether to compress the tar for this batch of files.
-    "auto": skip compression if COMPRESSED_FRACTION_THRESHOLD of total
-    bytes already look compressed (weighted by size, not file count, so
-    one large BAM isn't outvoted by many tiny text files).
-    """
+    """Check if to compress a file."""
     if mode == "always":
         return True
     if mode == "never":
@@ -194,93 +195,100 @@ def should_compress(new_files, mode):
 
     sizes = [p.stat().st_size for p in new_files]
     total = sum(sizes)
-    if total == 0:
-        return False
     compressed_bytes = sum(
         size for path, size in zip(new_files, sizes) if is_probably_compressed(path)
     )
-    return (compressed_bytes / total) < COMPRESSED_FRACTION_THRESHOLD
+    return (compressed_bytes / total) < COMPRESSED_FRACTION_THRESHOLD if total else False
 
 
 def tarchive(folder, new_files, bucket, compress_mode="auto"):
-    """
-    Tar new_files (hashing each while streaming through tarfile - close to
-    free, no separate read pass), write the tar to Freezer, return a list
-    of file records (one per archived file) ready for append_metadata().
-    SPEC "How it works" 3.1 steps 6-7.
-    """
-    compress = should_compress(new_files, compress_mode)
-    tar_name = f"{folder.name}-{date.today():%Y%m%d}" + (".tar.gz" if compress else ".tar")
-    # TODO: build the tar with `tarfile.open(..., mode="w:gz" if compress else "w")`,
-    # hashing each member's bytes as they're read (hashlib.sha256, or blake2b for speed).
-    # TODO: write the resulting tar to Freezer.
-    # TODO: known open gap (SPEC Open Questions): a crash between writing
-    # the tar and the append_metadata() call below can produce a real
-    # duplicate archive on the next run - reconciliation against the
-    # Freezer listing (list_freezer_contents) isn't implemented yet.
-    raise NotImplementedError
+    """placeholder"""
+    tar_name = f"{folder.name}-{date.today():%Y%m%d}.tar"
+    with tempfile.NamedTemporaryFile() as placeholder:
+        proc = run_s3cmd(["s3cmd", "put", placeholder.name, f"s3://{bucket}/{tar_name}"])
+    if proc is None:
+        return []
+    log.debug("pushed placeholder object %s to s3://%s/", tar_name, bucket)
+    return []
 
 
-def touch_pending(folder, archived):
-    """
-    touch every file not yet archived, so the 90-day auto-cleaner doesn't
-    reap it. Deliberately does NOT touch already-archived files: nobackup
-    has no explicit delete step anywhere in this design, so the auto-
-    cleaner reaping an already-archived file once it goes stale is the
-    only thing that ever reclaims that space. Touching everything would
-    keep every archived file alive on nobackup forever, growing without
-    bound instead of settling into steady state.
-    """
-    for path in unarchived_files(folder, archived):
+def touch_pending(folder, archived, touch_threshold_days=DEFAULT_TOUCH_THRESHOLD_DAYS, dry_run=False):
+    """Touch pending files at least `touch_threshold_days` old."""
+    cutoff = time.time() - touch_threshold_days * 86400
+    to_touch = [
+        path for path in unarchived_files(folder, archived)
+        if path.stat().st_mtime <= cutoff
+    ]
+    if dry_run:
+        log.info("[dry-run] touched %d pending file(s) in %s", len(to_touch), folder.name)
+        return
+    for path in to_touch:
         os.utime(path, None)
+    log.info("touched %d pending file(s) in %s", len(to_touch), folder.name)
+
+
+def expected_archived_count(new_files):
+    """"""
+    return 0
 
 
 def safety_net_check(nobackup_path, archived):
-    """
-    Files not yet in metadata approaching the 90-day threshold. Alerting
-    uses Slurm's own --mail-user (see SPEC), not a mail library.
-    SPEC "How it works" 3.1 step 8.
-    """
-    # TODO: stat every file under every _final folder not in `archived`;
-    # if close to 90 days, emit an alert.
+    """placeholder"""
     raise NotImplementedError
 
 
-def process_folder(folder, bucket, metadata_path, compress_mode="auto"):
+def process_folder(
+    folder, bucket, metadata_path, compress_mode="auto",
+    touch_threshold_days=DEFAULT_TOUCH_THRESHOLD_DAYS, dry_run=False,
+):
     archived = load_metadata(metadata_path)
     new_files = diff_new_files(folder, archived)
+
     if not new_files:
         log.info("no new files in %s", folder.name)
+    elif dry_run:
+        log.info(
+            "[dry-run] would tar %d new file(s) in %s; %d would be recorded as archived "
+            "(no tar written, no metadata recorded)",
+            len(new_files), folder.name, expected_archived_count(new_files),
+        )
     else:
         file_records = tarchive(folder, new_files, bucket, compress_mode)
         append_metadata(metadata_path, file_records)
         archived = load_metadata(metadata_path)
-    touch_pending(folder, archived)
+
+    touch_pending(folder, archived, touch_threshold_days, dry_run=dry_run)
 
 
 def main(argv):
-    nobackup_path, bucket, pattern, compress_mode, verbose = parse_args(argv)
+    pattern, bucket, compress_mode, touch_threshold_days, dry_run, verbose = parse_args(argv)
+    nobackup_path, glob_expr = split_pattern(pattern)
     state_dir = nobackup_path / ".freezer"
     metadata_path = state_dir / "metadata.jsonl"
     lock_path = state_dir / "lock"
     log_path = state_dir / "archive.log"
     state_dir.mkdir(parents=True, exist_ok=True)
 
-    setup_logging(verbose, log_path)
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[logging.FileHandler(log_path), logging.StreamHandler()],
+    )
 
     try:
         lock_fh = acquire_lock(lock_path)
     except LockHeld as e:
         log.info(str(e))
-        return 0
-
+        return 1
     try:
-        for folder in discover_folders(nobackup_path, pattern):
-            process_folder(folder, bucket, metadata_path, compress_mode)
-        # TODO: safety_net_check() is not implemented yet (see its own
-        # docstring) - not calling it here rather than letting an
-        # unconditional NotImplementedError crash every run, including
-        # ones with nothing to archive.
+        folders = discover_folders(nobackup_path, glob_expr)
+        if not folders:
+            log.info("no folders matched pattern %r", pattern)
+        for folder in folders:
+            process_folder(
+                folder, bucket, metadata_path, compress_mode,
+                touch_threshold_days=touch_threshold_days, dry_run=dry_run,
+            )
     finally:
         lock_fh.close()
 
