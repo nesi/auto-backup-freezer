@@ -10,7 +10,7 @@ This spec covers a pair of user-run tools that do the same job package finished 
 - Most source files are already compressed, so archiving only needs to **tar** (maybe test this tho)
 - Freezer data is rarely recalled **2 years is a sufficient retention period**.
 - one tape copy is acceptable
-- `nobackup` auto-deletes files after **90 days** of inactivity. things should not be deleted if being worked on by tool. Per the [NeSI docs](https://github.com/nesi/support-docs/blob/main/docs/Storage/Automatic_Cleaning_of_Nobackup.md), a file is deleted once its atime **and** ctime are both >90 days old and it was already on the previous fortnightly candidate list (listed, and its owner emailed, at ~76 days). mtime plays no part.
+- `nobackup` auto-deletes files after **90 days** of inactivity. things should not be deleted if being worked on by tool. Per the [NeSI docs](https://github.com/nesi/support-docs/blob/main/docs/Storage/Automatic_Cleaning_of_Nobackup.md), a file is deleted once its atime **and** ctime are both >90 days old and it was already on the previous fortnightly candidate list (listed, and its owner emailed, at ~76 days).
 - Not limited to `nobackup`: the watched folder can just as well be under `/nesi/project/<project>` or `/home/<user>`. The `nobackup` auto-cleaner is handled internally and never exposed to the user.
 - Users don't have access to regular cron on this compute. Scheduling instead uses **[scrontab](https://slurm.schedmd.com/scrontab.html)**
 
@@ -49,7 +49,6 @@ Runs on whatever schedule Tool 2 installed:
    - Uses `touch -a -c` (atime only, in batches): the real mtime is kept (so tars record it and drift detection isn't fooled), ctime is bumped anyway, and it only needs write access - setting explicit times (`os.utime(path, (now, mtime))`) would need file ownership, ruling out collaborators' group-writable files.
    - A file that vanished before it could be touched is skipped (INFO). A file that can't be touched (e.g. a collaborator's `600` file) gets one WARNING per folder naming it, since the cleaner will delete it; the run carries on.
    - The cleaner's published candidate list (`/search/autocleaner/filelists/current/<project>.gz`) isn't used here: it's readable on login03 only, not from the compute nodes `scrontab` jobs run on. Tool 2's `status` shows it instead (below).
-   - The threshold is a fixed constant (`TOUCH_THRESHOLD_DAYS`), not a flag on either tool.
 
 Throughout log every step locally. A failed or interrupted copy must be detected and resumed/retried on the next run rather than leaving a partial tar on Freezer.
 
