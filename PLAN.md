@@ -44,34 +44,61 @@
 - [x] Write to Freezer,`s3cmd put --preserve`, verified against real Freezer (`test-guest-collection-11926`)
 - [x] Record new archive in metadata list,`append_metadata()`, one JSON line per file incl. checksum
 - [x] `touch` files not yet archived `touch_pending()`
+- [x] Touch only when the base dir's real path is under `/nesi/nobackup` (`needs_touch()`), so watched folders can live in `project`/`home` without their mtimes being rewritten.
 - [x] Resumability, safe retry, no duplicate tars,`next_tar_name()` fixed a bug: two same-day runs computed the same tar name, so the second silently overwrote the first while metadata still claimed both were archived. Verified live. Mid-upload crashes are safe by construction (nothing recorded until upload+checksum succeed).
 - [ ] Open, lower severity: no cleanup of an abandoned incomplete multipart upload left by a killed run,storage/cost leak, not a correctness bug
 - [x] Concurrency guard, lock file (on top of `scrontab`'s own serialization),`acquire_lock()`
 - [x] Drift detection + `--overwrite`,`detect_drift()` compares recorded vs. current mtime, warns by default; `--overwrite` re-archives drifted files under a new tar name
+- [x] Drift warning summarised, one WARNING per folder (per-file detail at INFO) instead of one per file per run
 
-## Phase 4b,Tool 1 retention deletion
+## Phase 4b,Tool 1 retention
 
 - [x] `list_bucket_objects()`, bucket listing with each object's `LastModified` as archive date; returns `None` (not `{}`) on failure so that isn't mistaken for "delete everything"
-- [x] `--retention-days` (default 730) / `--retention-warn-days` (default 30) flags, `-r` short form for the former
 - [x] `delete_expired_archives()`: once-per-run pass matching metadata `tar_name`s against the bucket listing, finds tars past `archive_date + retention_days`
-- [x] Warn-before-delete: logs once a tar enters the warn window
+- [x] Warn-only by default, same as drift: expired tars get one summary WARNING per run (count, oldest, how to delete), per-tar detail at INFO. Scheduled runs never delete from Freezer
+- [x] `--delete-expired` (`-d`) flag, the only way expired tars get `s3cmd del`'d. Never written into `scrontab`
 - [x] Tar missing from the bucket listing (deleted by hand) recorded as `deleted` immediately, no `s3cmd del` call
 - [x] Otherwise `s3cmd del`, then append a `deleted` event record (append-only; `load_metadata()` skips these, `load_deleted_tars()` reads them back)
+- [x] `deleted` event only recorded if `s3cmd del` actually ran, fixed a bug: s3cmd-not-configured (exit 78) returned `None` and a deletion was recorded anyway. Same fix on the `--overwrite` superseded-tar path. Unit-tested both
 - [x] `--dry-run` covers this pass
-- [x] `--retention-days 0` disables deletion for that entry
-- [x] Verified live: warn path, "deleted by hand" path, re-run no-op all confirmed with real `s3cmd` output
+- [x] `--retention-days 0` disables retention (no warnings, nothing expires) for that entry
+- [x] Verified live: "deleted by hand" path, re-run no-op all confirmed with real `s3cmd` output
+- [ ] Verify live: warn-only summary and `--delete-expired` deletion against real `s3cmd`
 - [x] Wired into `archive_tool` (Phase 5)
+
+## Phase 4c,Tool 1 nobackup auto-cleaner protection
+
+- [x] Age = newer of atime and ctime (what the cleaner checks), not mtime. mtime ≤ ctime always, so today's check never misses a file, it just touches some needlessly
+- [x] Threshold 60 days, so pending files never reach the ~76-day list or trigger the warning email. Leaves ~16 days' margin for a fortnightly cycle plus a missed run.
+- [x] Touch atime only, keeping the real mtime: `touch -a -c -- <files>`, in batches. Any timestamp change also bumps ctime, so both of the cleaner's clocks reset
+  - Not `os.utime(path, (now, mtime))`: setting explicit times needs file *ownership*, whereas "atime to now, leave mtime" needs only write access, so collaborators' group-writable files couldn't be touched any more. `os.utime` can't express "leave mtime"; coreutils `touch -a` can (`UTIME_OMIT`)
+  - Fixes: tars no longer record a fake mtime for files that sat pending past the threshold, and touching no longer bumps mtime on drifted files left as-is
+- [x] Per-file failures don't abort the run (MANUAL_TESTS items):
+  - file vanished between discovery and touch (`stat()` is unguarded today) → skip, INFO
+  - no permission (e.g. a collaborator's `600` file) → one WARNING naming the files (from `touch`'s stderr), since the cleaner will delete them; rest of the run continues
+- [x] Unit tests:
+  - old mtime but recent atime → not touched; old atime and ctime → touched
+  - 60-day boundary (59 not touched, 60 touched)
+  - mtime unchanged after touching (real `touch` on a temp file)
+  - vanished file skipped; permission failure warns and the run continues
+  - batching, and no `touch` call at all when nothing is stale
+  - `--dry-run` still only reports "would touch N"
+- [ ] Verify live on a collaborator's group-writable file
 
 ## Phase 5 tool2 setup CLI
 
-- [x] Collect params (folder, bucket, schedule, `--retention-days`/`--retention-warn-days`, optional with SPEC defaults)
-- [x] Validate: folder exists/writable,Freezer access check and `775`/group perms warning were TODOs in `validate()` (closed below)
+- [x] Collect params (folder, bucket, schedule, `--retention-days`, optional with SPEC defaults)
+- [x] Validate: folder exists/writable, Freezer access check (`s3cmd ls` on the bucket) and `775`/group perms warning, all inline in `validate()`
 - [x] Install/update `scrontab` entry (marker-tagged, idempotent),now embeds retention fields too, `ENTRY_RE` updated to match
 - [x] Print summary
-- [x] `status` command: archived count, last run, retention-days, due/pending/deleted counts (`retention_status()`, own `list_bucket_dates()`,deliberately duplicated from `runner_archive.py`, not imported, per one-file-per-command convention). Verified live.
-- [x] `--dry-run` on `add`,`preview_archive_run()` shells out to `runner_archive --dry-run` for the file-level preview plus a would-add/would-update line for the scrontab entry; writes nothing
-- [x] `enable`/`disable` subcommands,`disable_entry()`/`enable_entry()` comment/uncomment the managed line in place
-- [x] `validate()` Freezer-access check (`check_freezer_access()`) and 775/group-perms warning (`warn_on_bad_group_permissions()`, never fails validation)
+- [x] `status` command: archived count, last run, next run, retention-days, expired/deleted counts, plus the exact `runner_archive … --delete-expired` command when anything's expired (`retention_status()`, own `list_bucket_dates()`,deliberately duplicated from `runner_archive.py`, not imported, per one-file-per-command convention). Verified live.
+- [x] `add` writes a `#SCRON --job-name=archive_tool-<id>` directive above each entry; add/remove/remove --all handle it with its cron line. Older entries without it still parse
+- [x] `status` "next run" from `squeue --me` (pending scron job's start time, fixed `SLURM_TIME_FORMAT`), one call for all entries; "running now", "not scheduled" (e.g. Slurm-disabled), and "unknown" (squeue unavailable) cases. `touch after` line removed. Verified live against real `squeue`
+- [x] Group-writable warning in `validate()` only for shared space (`/nesi/project`, `/nesi/nobackup`), not e.g. `/home`
+- [ ] Default schedule `0 2 * * *` actually runs at 14:00 NZST (controller is UTC). Pick a default that's intended in local time, or document it
+- [x] `--dry-run` on `add`,`run_archive(dry_run=True)` shells out to `runner_archive --dry-run` for the file-level preview plus a would-add/would-update line for the scrontab entry; writes nothing
+- [x] `validate()` Freezer-access check (distinguishes s3cmd missing / not configured / no bucket access) and 775/group-perms warning (stderr only, never fails validation)
+- [ ] Verify live: copy-paste the quoted `--delete-expired` command from `status` (with and without `--dry-run`)
 
 ## Phase 6 tool validation
 
@@ -81,8 +108,7 @@
    ,a file vanishing mid-run (nobackup is live) used to crash `tarchive()` and abort the whole run,now skipped with a warning
    ,a pattern containing a single quote (e.g. `O'Brien_final`) broke scrontab-line quoting,now rejected by `validate()`
    ,`cmd_add()` let a `validate()` failure crash with a raw traceback,now caught and reported as a clean CLI error
-- [x] Retention boundary conditions (warn-window edge, retention-day cutoff, one day short),all correct, no off-by-one
-- [x] Confirm `touch` resets mtime as the auto-cleaner expects,`os.utime(path, None)`, unit-tested. Can't confirm against the real 90-day cleaner without a wait or NeSI sysadmin input
+- [x] Retention boundary conditions (retention-day cutoff, one day short),all correct, no off-by-one
 - [x] Tool 2 re-run updates (not duplicates) the `scrontab` entry,`add_or_update_entry()`, marker-based replace, unit-tested
 
 ## Phase 7 Rollout
