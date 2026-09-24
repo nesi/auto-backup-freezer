@@ -29,6 +29,9 @@ NOBACKUP_ROOT = "/nesi/nobackup"
 DEFAULT_RETENTION_DAYS = 730
 COMPRESS_MODES = ("auto", "always", "never")
 COMPRESSED_FRACTION_THRESHOLD = 0.9  # 'auto' won't compress if at least this fraction (by bytes) already is
+# Stored on the object as x-amz-meta-chunksize, so a multipart ETag can be
+# (see github.com/nesi/auto-checksum-freezer).
+MULTIPART_CHUNK_SIZE_MB = 15
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 DEFAULT_LOG_LEVEL = "INFO"
 
@@ -262,7 +265,7 @@ def list_bucket_objects(bucket):
 
 
 def fetch_checksum(bucket, tar_name):
-    """Whole-file MD5 from `s3cmd info` (via --preserve's stored attrs - the raw ETag is wrong for multipart)."""
+    """Whole-file MD5 from `s3cmd info` (via --preserve's stored attrs)."""
     proc = run_s3cmd(["s3cmd", "info", bucket_uri(bucket, tar_name)], capture_output=True, text=True)
     lines = proc.stdout.splitlines() if proc else []
     return next((l.split(":", 1)[1].strip() for l in lines if l.strip().startswith("MD5 sum:")), None)
@@ -324,7 +327,9 @@ def tarchive(folder, new_files, bucket, archived=None, compress_mode="auto"):
                     continue
                 added.append((path, st))
         # --preserve forced rather than left to ~/.s3cfg: fetch_checksum() relies on it
-        if not added or run_s3cmd(["s3cmd", "put", "--preserve", tmp.name, bucket_uri(bucket, tar_name)]) is None:
+        put = ["s3cmd", "put", "--preserve", f"--multipart-chunk-size-mb={MULTIPART_CHUNK_SIZE_MB}",
+               f"--add-header=x-amz-meta-chunksize:{MULTIPART_CHUNK_SIZE_MB}", tmp.name, bucket_uri(bucket, tar_name)]
+        if not added or run_s3cmd(put) is None:
             return []
         checksum = fetch_checksum(bucket, tar_name)
 
