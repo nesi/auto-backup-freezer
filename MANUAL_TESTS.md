@@ -141,6 +141,7 @@ Use `--no-run` for most of these, so you're testing the scrontab handling rather
 
 - [ ] Uploads preserve attributes whatever `~/.s3cfg` says.
 - [ ] The recorded checksum matches both `s3cmd info` and a downloaded copy, including for multipart uploads.
+- [ ] Every tar has `x-amz-meta-chunksize: 15` (`s3cmd info`), whatever `multipart_chunk_size_mb` is in `~/.s3cfg`. For a multipart tar, `multipart-checksum <downloaded tar> 15` ([auto-checksum-freezer](https://github.com/nesi/auto-checksum-freezer)) matches Freezer's ETag (shown by `s3cmd ls -l`).
 - [ ] (!!) A missing MD5 is recorded as `null`, and the files still count as archived. Should that fail instead?
 - [ ] The temp tar goes to `$TMPDIR` (or `/tmp`) and is always cleaned up. Check the free space there on login nodes and inside scron jobs.
 
