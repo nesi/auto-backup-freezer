@@ -54,7 +54,7 @@ If you do a test, please date and sign your name.
 - [ ] Bucket given with and without `s3://` is treated the same.
 - [ ] Relative patterns work, and are stored as absolute paths in scrontab entries.
 - [ ] `-m` is accepted and otherwise ignored (it's a stub).
-- [ ] Exit codes are consistent: 0 success, 1 runtime failure (lock held, bad bucket, unexpected error), 2 usage error. (!!) `runner_archive` exits 0 when s3cmd isn't configured.
+- [ ] Exit codes are consistent: 0 success, 1 runtime failure, 2 usage error. `runner_archive` exits 1 iff it logged any WARNING/ERROR (incl. s3cmd not configured), and 0 when the lock is held.
 
 ## `archive_tool add`
 
@@ -64,7 +64,7 @@ Use `--no-run` for most of these, so you're testing the scrontab handling rather
 
 - [ ] Bad base dirs (missing, not writable, glob in a parent component) are rejected with a clean message and no traceback, and scrontab is unchanged.
 - [ ] Awkward patterns: spaces, `'`, `%`, `$`, backtick, `;`, `~`, trailing slash. Each is either rejected clearly, or installed so the scheduled run uses it literally (no expansion or injection). (!!) Check whether scrontab treats `%` specially, as cron does. (!!) A quoted `~` gives a confusing "does not exist" error.
-- [ ] (!!) `--bucket` and `--mail-user` are written into the line **unquoted**, so `-m 'x;touch /tmp/pwned'` would be executed. Confirm, and decide on quoting or stricter validation.
+- [ ] (!!) `--bucket` is written into the cron line **unquoted**, so `-b 'x;touch /tmp/pwned'` would be executed. Confirm, and decide on quoting or stricter validation. `--mail-user` is now on the `#SCRON` directive (parsed by scrontab, not a shell) - check `-m 'x;touch /tmp/pwned'` and `-m 'a@b --time=99'` do nothing odd.
 - [ ] Bucket problems (doesn't exist, no access, s3cmd unconfigured, s3cmd not on PATH) give clear, distinct messages and exit 1.
 - [ ] A shared base dir (`/nesi/project`, `/nesi/nobackup`) that isn't group-writable gives a warning, but `add` still succeeds. No warning elsewhere.
 - [ ] (!!) An invalid schedule (`-s "not a cron"`, `-s "61 * * * *"`) isn't validated, so scrontab fails with a raw traceback. Check that the existing table isn't damaged.
@@ -274,6 +274,16 @@ Things users could plausibly have in their shell that might change behaviour. Th
 - [ ] (!!) Gaps: real runs don't log which folders matched, or a per-folder new-file count.
 - [ ] (!!) The log grows unbounded, with no rotation. Decide on rotation.
 
-## Out of scope for now
+## Mail
 
-- [ ] Mail notifications (`--mail-user` is a stub).
+A run that logs any WARNING/ERROR exits 1, so the entry's `#SCRON ... --mail-type=FAIL --mail-user=X` mails X. Under its `archive_tool-<id>` job, `runner_archive` first puts those messages in the job comment (the mail body) and sleeps 5s.
+
+Already checked with plain `sbatch` jobs (2026-09-25): `scontrol update Comment=` keeps newlines, quotes/`$`/backticks and unicode; 1024 chars is accepted, 1025+ is rejected outright ("too long", comment left empty), hence the 1024-byte cap. An end-to-end `runner_archive --dry-run` with 12 drift warnings stored a 981-byte comment (3 warnings + "... and 9 more").
+
+- [ ] (!!) scrontab accepts several options on one `#SCRON` line (`--job-name=... --mail-type=FAIL --mail-user=...`): `add -m`, then check `scontrol show job` on the pending job shows the MailUser/MailType.
+- [ ] The mail arrives, and its body is the comment, with the line breaks intact.
+- [ ] A clean run sends no mail. A run where the lock is held sends no mail.
+- [ ] `add` without `-m`, then with, then without again: the directive gains/loses the mail options, `status` shows it.
+- [ ] A hand run (login node or inside an interactive `srun`) doesn't touch any job comment and doesn't sleep.
+- [ ] Unexpected exception: the mail shows `ERROR unexpected error ...` without the traceback, which is in `archive.log`.
+- [ ] Two entries on the same schedule both failing: confirm the rate limiter merges them into one subjects-only mail (no comments).

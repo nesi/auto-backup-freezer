@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from datetime import date
 from itertools import count
 from pathlib import Path
-from typing import Optional
 
 PROGNAME = "runner_archive"
 STATE_DIR_NAME = ".freezer"  # metadata/lock/log dir, never archived
@@ -34,6 +33,14 @@ COMPRESSED_FRACTION_THRESHOLD = 0.9  # 'auto' won't compress if at least this fr
 MULTIPART_CHUNK_SIZE_MB = 15
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 DEFAULT_LOG_LEVEL = "INFO"
+# Mirrored from archive_tool.py: its scrontab entries run under this job-name
+# prefix, with --mail-type=FAIL mailing the job's comment as the body.
+JOB_NAME_PREFIX = "archive_tool-"
+# `scontrol update Comment=` rejects anything longer outright (tested: 1024 set, 1025 "too long").
+MAX_COMMENT_BYTES = 1024
+MAX_MESSAGE_BYTES = 400
+DRIFT_NAMES_SHOWN = 3  # changed files named in the drift warning, the rest counted
+COMMENT_SETTLE_SECONDS = 5  # for slurmctld to record the comment before the job ends and the mail goes out
 
 USAGE = f"""usage: {PROGNAME} [OPTIONS]
 
@@ -45,15 +52,13 @@ USAGE = f"""usage: {PROGNAME} [OPTIONS]
   -o, --overwrite           re-archive files changed since archiving, deleting the tar they superseded
   -n, --dry-run             don't change anything, just log what would happen
   -l, --log-level LEVEL     console log level: DEBUG, INFO (default), WARNING, ERROR
-  -m, --mail-user EMAIL     email this run's output to EMAIL (STUB)
   -h, --help                show this message
 """
 
 # (short, long) - a trailing "=" means the option takes a value
 OPTIONS = [
     ("p", "pattern="), ("b", "bucket="), ("c", "compress="), ("r", "retention-days="),
-    ("d", "delete-expired"), ("o", "overwrite"), ("n", "dry-run"), ("l", "log-level="),
-    ("m", "mail-user="), ("h", "help"),
+    ("d", "delete-expired"), ("o", "overwrite"), ("n", "dry-run"), ("l", "log-level="), ("h", "help"),
 ]
 
 # Magic bytes of already-compressed formats (BAM is BGZF, so shares gzip's).
@@ -62,8 +67,22 @@ MAGIC_BYTES = [b"\x1f\x8b", b"BZh", b"\xfd7zXZ\x00", b"\x28\xb5\x2f\xfd", b"PK\x
 log = logging.getLogger(PROGNAME)
 
 
+class MessageCollector(logging.Handler):
+    """Keeps this run's WARNING-and-up messages: any at all fail the run, and they're the failure mail's body."""
+
+    def __init__(self):
+        super().__init__(logging.WARNING)
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(f"{record.levelname} {record.getMessage()}")  # no traceback: that's in archive.log
+
+
 def setup_logging(log_path, log_level):
-    """archive.log gets everything, the console only --log-level and up. Call once per process."""
+    """
+    archive.log gets everything, the console only --log-level and up. Returns
+    the run's MessageCollector. Call once per process.
+    """
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     log.setLevel(logging.DEBUG)
     for handler, level in ((logging.FileHandler(log_path), logging.DEBUG),
@@ -71,6 +90,51 @@ def setup_logging(log_path, log_level):
         handler.setLevel(level)
         handler.setFormatter(formatter)
         log.addHandler(handler)
+    collector = MessageCollector()
+    log.addHandler(collector)
+    return collector
+
+
+def comment_body(messages, log_path):
+    """
+    A header, then as many messages as fit in MAX_COMMENT_BYTES (each cut to
+    MAX_MESSAGE_BYTES, so one huge one can't crowd out the rest), then a count
+    of any left over.
+    """
+    lines = [f"{len(messages)} problem(s) archiving {log_path.parent.parent}, full log: {log_path}"]
+    for i, message in enumerate(messages):
+        if len(message.encode()) > MAX_MESSAGE_BYTES:
+            message = message.encode()[:MAX_MESSAGE_BYTES - 3].decode(errors="ignore") + "..."
+        rest = f"... and {len(messages) - i} more"
+        # room for this message and, unless it's the last, the "more" line
+        tail = [] if i == len(messages) - 1 else [f"... and {len(messages) - i - 1} more"]
+        if len("\n".join([*lines, message, *tail]).encode()) > MAX_COMMENT_BYTES:
+            lines.append(rest)
+            break
+        lines.append(message)
+    return "\n".join(lines)
+
+
+def set_job_comment(messages, log_path):
+    """
+    Put `messages` in this run's Slurm job comment, the body of its
+    --mail-type=FAIL email. Only under an archive_tool scrontab job: a hand run
+    already printed them, and shouldn't touch an interactive session's job.
+    """
+    job_id = os.environ.get("SLURM_JOB_ID")
+    if not job_id or not os.environ.get("SLURM_JOB_NAME", "").startswith(JOB_NAME_PREFIX):
+        return
+    body = comment_body(messages, log_path)
+    try:
+        proc = subprocess.run(["scontrol", "update", f"JobId={job_id}", f"Comment={body}"],
+                              capture_output=True, text=True)
+    except FileNotFoundError:
+        log.error("could not set the job comment for the failure mail: scontrol not found")
+        return
+    if proc.returncode:
+        log.error("could not set the job comment for the failure mail: %s", proc.stderr.strip())
+        return
+    time.sleep(COMMENT_SETTLE_SECONDS)
 
 
 def usage_error(msg):
@@ -100,7 +164,6 @@ class Args:
     overwrite: bool
     dry_run: bool
     log_level: str
-    mail_user: Optional[str]
 
 
 def parse_args(argv):
@@ -127,7 +190,6 @@ def parse_args(argv):
         overwrite="-o" in opts,
         dry_run="-n" in opts,
         log_level=(opts.get("-l") or DEFAULT_LOG_LEVEL).upper(),
-        mail_user=opts.get("-m"),
     )
     if not args.pattern or not args.bucket:
         usage_error("--pattern and --bucket are required")
@@ -476,9 +538,12 @@ def process_folder(folder, bucket, metadata_path, compress_mode="auto", dry_run=
         # One summary WARNING per folder, like the expired-tar one.
         for path in drifted:
             log.info("%s changed since it was archived - Freezer copy left as-is", path)
-        log.warning("%d file(s) in %s changed since they were archived - Freezer copies left as-is. "
+        names = [str(p.relative_to(folder)) for p in sorted(drifted)]
+        shown = ", ".join(names[:DRIFT_NAMES_SHOWN]) + (f", +{len(names) - DRIFT_NAMES_SHOWN} more"
+                                                        if len(names) > DRIFT_NAMES_SHOWN else "")
+        log.warning("%d file(s) in %s changed since they were archived (%s) - Freezer copies left as-is. "
                     "To re-archive them, run: %s (add --dry-run first to preview)",
-                    len(drifted), folder.name, overwrite_command or "runner_archive with --overwrite")
+                    len(drifted), folder.name, shown, overwrite_command or "runner_archive with --overwrite")
         left_as_is = drifted
 
     if not new_files:
@@ -508,16 +573,29 @@ def process_folder(folder, bucket, metadata_path, compress_mode="auto", dry_run=
 
 
 def main(argv):
+    """
+    Exits 1 if anything was logged at WARNING or up - each needs someone to act -
+    so an entry's --mail-type=FAIL mails them (see set_job_comment()).
+    """
     args = parse_args(argv)
     base_dir, glob_expr = split_pattern(args.pattern)
     state_dir = base_dir / STATE_DIR_NAME
     state_dir.mkdir(parents=True, exist_ok=True)
-    setup_logging(state_dir / "archive.log", args.log_level)
+    log_path = state_dir / "archive.log"
+    collector = setup_logging(log_path, args.log_level)
+    run(args, base_dir, glob_expr, state_dir)
+    if not collector.messages:
+        return 0
+    set_job_comment(collector.messages, log_path)
+    return 1
 
+
+def run(args, base_dir, glob_expr, state_dir):
+    """One archive run. Problems are logged (WARNING/ERROR) rather than raised."""
     lock = acquire_lock(state_dir / "lock")
-    if lock is None:
+    if lock is None:  # e.g. a hand run overlapping - not a failure, the other run is doing the work
         log.info("lock already held: %s", state_dir / "lock")
-        return 1
+        return
     metadata_path = state_dir / "metadata.jsonl"
     try:
         touch = needs_touch(base_dir)
@@ -533,10 +611,8 @@ def main(argv):
                                 delete_command=manual_command(args, "--delete-expired"))
     except Exception:
         log.error("unexpected error during archive run", exc_info=True)  # into archive.log, not a bare traceback
-        return 1
     finally:
         lock.close()
-    return 0
 
 
 if __name__ == "__main__":

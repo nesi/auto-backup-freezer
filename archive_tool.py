@@ -109,16 +109,27 @@ def job_name_for(id_):
     return f"{JOB_NAME_PREFIX}{id_}"
 
 
-def directive_for(id_):
-    """Written above each entry's cron line, so its Slurm job can be found in squeue."""
-    return f"#SCRON --job-name={job_name_for(id_)}\n"
+def directive_for(id_, mail_user=None):
+    """
+    Written above each entry's cron line, so its Slurm job can be found in
+    squeue. With `mail_user`, Slurm mails them when a run fails - i.e. logged a
+    warning (runner_archive puts those in the job comment, the mail's body).
+    """
+    mail = f" --mail-type=FAIL --mail-user={mail_user}" if mail_user else ""
+    return f"#SCRON --job-name={job_name_for(id_)}{mail}\n"
+
+
+DIRECTIVE_RE = re.compile(
+    r"^#SCRON --job-name=" + re.escape(JOB_NAME_PREFIX) + r"(?P<id>[0-9a-f]+)"
+    r"(?: --mail-type=FAIL --mail-user=(?P<mail_user>\S+))?\s*$"
+)
 
 
 def _is_managed_line(line, id_=None):
     """An entry's cron line (by marker) or #SCRON directive - for one entry id, or any if id is None."""
     if id_ is None:
         return MARKER_PREFIX in line or line.strip().startswith(f"#SCRON --job-name={JOB_NAME_PREFIX}")
-    return marker_for(id_) in line or line.strip() == directive_for(id_).strip()
+    return marker_for(id_) in line or line.strip().split(" ", 2)[:2] == ["#SCRON", f"--job-name={job_name_for(id_)}"]
 
 
 def resolve_to_id(raw):
@@ -176,11 +187,11 @@ def write_scrontab(content):
     subprocess.run(["scrontab", "-"], input=content, text=True, check=True)
 
 
-def runner_archive_flags(compress_mode=None, retention_days=None, log_level=None, mail_user=None):
+def runner_archive_flags(compress_mode=None, retention_days=None, log_level=None):
     """runner_archive flags; None/empty ones are omitted, leaving runner_archive's default."""
     flags = []
     for flag, value in (("--compress", compress_mode), ("--retention-days", retention_days),
-                        ("--log-level", log_level), ("--mail-user", mail_user)):
+                        ("--log-level", log_level)):
         if value is not None and value != "":
             flags += [flag, str(value)]
     return flags
@@ -192,9 +203,9 @@ def manual_command(entry, flag):
                        *runner_archive_flags(entry.get("compress"), retention_of(entry)), flag])
 
 
-def build_entry(schedule, pattern, bucket, compress_mode=None, retention_days=None, log_level=None, mail_user=None):
+def build_entry(schedule, pattern, bucket, compress_mode=None, retention_days=None, log_level=None):
     """The entry's cron line (add_or_update_entry() writes directive_for() above it)."""
-    flags = " ".join(runner_archive_flags(compress_mode, retention_days, log_level, mail_user))
+    flags = " ".join(runner_archive_flags(compress_mode, retention_days, log_level))
     return (f"{schedule} runner_archive --pattern '{pattern}' --bucket {bucket} "
             f"{flags + ' ' if flags else ''}{marker_for(entry_id(pattern))}\n")
 
@@ -205,15 +216,16 @@ ENTRY_RE = re.compile(
     r"(?:--compress (?P<compress>\S+) )?"
     r"(?:--retention-days (?P<retention_days>\d+) )?"
     r"(?:--log-level (?P<log_level>\S+) )?"
-    r"(?:--mail-user (?P<mail_user>\S+) )?"
     + re.escape(MARKER_PREFIX) + r":(?P<id>[0-9a-f]+)\s*$"
 )
 
 
 def list_entries():
-    """Managed entries, parsed back out of the table (plus their raw "line")."""
-    return [{**m.groupdict(), "line": line.strip()}
-            for line in read_scrontab().splitlines() if (m := ENTRY_RE.match(line.strip()))]
+    """Managed entries, parsed back out of the table (plus their cron "line", and "mail_user" from the directive)."""
+    lines = [line.strip() for line in read_scrontab().splitlines()]
+    mail_users = {m["id"]: m["mail_user"] for line in lines if (m := DIRECTIVE_RE.match(line))}
+    return [{**m.groupdict(), "mail_user": mail_users.get(m["id"]), "line": line}
+            for line in lines if (m := ENTRY_RE.match(line))]
 
 
 def check_id_collision(pattern):
@@ -232,8 +244,8 @@ def add_or_update_entry(schedule, pattern, bucket, compress_mode=None, retention
     lines = [l for l in read_scrontab().splitlines(keepends=True) if not _is_managed_line(l, id_)]
     if lines and not lines[-1].endswith("\n"):
         lines[-1] += "\n"  # else the directive would be glued onto the last line
-    lines += [directive_for(id_),
-              build_entry(schedule, pattern, bucket, compress_mode, retention_days, log_level, mail_user)]
+    lines += [directive_for(id_, mail_user),
+              build_entry(schedule, pattern, bucket, compress_mode, retention_days, log_level)]
     write_scrontab("".join(lines))
 
 
@@ -427,7 +439,7 @@ ADD_USAGE = f"""usage: {PROGNAME} add [OPTIONS]
   -r, --retention-days N warn once a tar in Freezer is this old (default 730, 0 disables);
                          `status` shows the command to delete them
   -l, --log-level LEVEL  DEBUG, INFO (default), WARNING, ERROR
-  -m, --mail-user EMAIL  email each run's output to EMAIL (STUB)
+  -m, --mail-user EMAIL  email EMAIL when a run logs warnings or errors
   -n, --dry-run          don't change anything, just show what would happen
       --no-run           don't run the archive straight away
   -y, --yes              don't prompt for confirmation
@@ -464,7 +476,7 @@ def parse_add_args(argv):
 
 
 def run_archive(pattern, bucket, compress_mode, retention_days, dry_run, log_level=None):
-    """Run what the entry would run (without --mail-user: the output's shown here), with --dry-run if previewing."""
+    """Run what the entry would run, with --dry-run if previewing. Warnings print here rather than mailing."""
     argv = ["runner_archive", "--pattern", pattern, "--bucket", bucket,
             *runner_archive_flags(compress_mode, retention_days, log_level), *(["--dry-run"] if dry_run else [])]
     proc = subprocess.run(argv, capture_output=True, text=True)
@@ -490,10 +502,12 @@ def cmd_add(argv):
         print(f"{PROGNAME}: {e}", file=sys.stderr)
         return 1
 
-    settings = (args.compress_mode, args.retention_days, args.log_level, args.mail_user)
+    settings = (args.compress_mode, args.retention_days, args.log_level)
     run = partial(run_archive, args.pattern, args.bucket, args.compress_mode, args.retention_days,
                   log_level=args.log_level)
-    entry = build_entry(args.schedule, args.pattern, args.bucket, *settings).strip()
+    # the mail setting lives on the #SCRON directive, not the cron line - show it too
+    entry = (f"{build_entry(args.schedule, args.pattern, args.bucket, *settings).strip()}"
+             f" (mail: {args.mail_user or 'none'})")
     existing = next((e for e in list_entries() if e["id"] == entry_id(args.pattern)), None)
 
     if args.dry_run:
@@ -502,11 +516,12 @@ def cmd_add(argv):
         return 0
     if existing and not args.yes and not _confirm(
             "add", ["an entry already exists for this pattern:",
-                    f"  current:  {existing['line']}", f"  new:      {entry}"], "overwrite?"):
+                    f"  current:  {existing['line']} (mail: {existing['mail_user'] or 'none'})",
+                    f"  new:      {entry}"], "overwrite?"):
         print(f"{PROGNAME}: aborted. No changes made.", file=sys.stderr)
         return 1
 
-    add_or_update_entry(args.schedule, args.pattern, args.bucket, *settings)
+    add_or_update_entry(args.schedule, args.pattern, args.bucket, *settings, mail_user=args.mail_user)
     state_dir = split_pattern(args.pattern)[0] / STATE_DIR_NAME
     print(f"added: {entry}\nlog:       {state_dir}/archive.log\nmetadata:  {state_dir}/metadata.jsonl")
     if not args.no_run:
