@@ -180,7 +180,12 @@ def validate(pattern, bucket):
 # --- scrontab -----------------------------------------------------------------
 
 def read_scrontab():
-    return subprocess.run(["scrontab", "-l"], capture_output=True, text=True).stdout
+    proc = subprocess.run(["scrontab", "-l"], capture_output=True, text=True)
+    if proc.returncode == 0:
+        return proc.stdout
+    if "no crontab for" in proc.stdout + proc.stderr:  # no table yet
+        return ""
+    raise RuntimeError(f"scrontab -l failed: {(proc.stderr or proc.stdout).strip()}")
 
 
 def write_scrontab(content):
