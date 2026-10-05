@@ -1,5 +1,5 @@
 #!/bin/python
-"""Archives matching folders to Freezer. Runs unattended from a scrontab entry installed by `archive_tool add`."""
+"""Archives matching folders to Freezer. Runs unattended from a scrontab entry installed by `freezer_backup add`."""
 
 import fcntl
 import getopt
@@ -17,7 +17,7 @@ from datetime import date
 from itertools import count
 from pathlib import Path
 
-PROGNAME = "runner_archive"
+PROGNAME = "freezer_backup_runner"
 STATE_DIR_NAME = ".freezer"  # metadata/lock/log dir, never archived
 # nobackup's auto-cleaner deletes a file once its atime and ctime are both >90
 # days old, having listed it (and emailed its owner) at ~76. 60 keeps pending
@@ -33,9 +33,9 @@ COMPRESSED_FRACTION_THRESHOLD = 0.9  # 'auto' won't compress if at least this fr
 MULTIPART_CHUNK_SIZE_MB = 15
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 DEFAULT_LOG_LEVEL = "INFO"
-# Mirrored from archive_tool.py: its scrontab entries run under this job-name
+# Mirrored from .freezer_backup.py: its scrontab entries run under this job-name
 # prefix, with --mail-type=FAIL mailing the job's comment as the body.
-JOB_NAME_PREFIX = "archive_tool-"
+JOB_NAME_PREFIX = "freezer_backup-"
 # `scontrol update Comment=` rejects anything longer outright (tested: 1024 set, 1025 "too long").
 MAX_COMMENT_BYTES = 1024
 MAX_MESSAGE_BYTES = 400
@@ -118,7 +118,7 @@ def comment_body(messages, log_path):
 def set_job_comment(messages, log_path):
     """
     Put `messages` in this run's Slurm job comment, the body of its
-    --mail-type=FAIL email. Only under an archive_tool scrontab job: a hand run
+    --mail-type=FAIL email. Only under an freezer_backup scrontab job: a hand run
     already printed them, and shouldn't touch an interactive session's job.
     """
     job_id = os.environ.get("SLURM_JOB_ID")
@@ -444,7 +444,7 @@ def touch_pending(folder, archived, extra_paths=(), dry_run=False, now=None):
 
 def manual_command(args, flag):
     """This run's invocation plus `flag`, for warnings to quote. Keeps non-default settings so a hand run matches."""
-    argv = ["runner_archive", "--pattern", args.pattern, "--bucket", args.bucket]
+    argv = ["freezer_backup_runner", "--pattern", args.pattern, "--bucket", args.bucket]
     if args.compress_mode != "auto":
         argv += ["--compress", args.compress_mode]
     if args.retention_days != DEFAULT_RETENTION_DAYS:
@@ -473,7 +473,7 @@ def delete_expired_archives(bucket, metadata_path, retention_days=DEFAULT_RETENT
             else:
                 log.info("%s already absent from Freezer - recording as deleted", tar_name)
                 record_deleted(metadata_path, tar_name)
-        elif (age := (date.today() - objects[tar_name]).days) >= retention_days:  # mirrored in archive_tool
+        elif (age := (date.today() - objects[tar_name]).days) >= retention_days:  # mirrored in freezer_backup
             expired.append((tar_name, age))
     if not expired:
         return
@@ -486,7 +486,7 @@ def delete_expired_archives(bucket, metadata_path, retention_days=DEFAULT_RETENT
         log.warning("%d archive(s) past the %d-day retention period (oldest: %s, %d days old) - Freezer copies "
                     "left as-is. To delete them, run: %s (add --dry-run first to preview)",
                     len(expired), retention_days, oldest, oldest_age,
-                    delete_command or "runner_archive with --delete-expired")
+                    delete_command or "freezer_backup_runner with --delete-expired")
         return
 
     for tar_name, age in expired:
@@ -543,7 +543,7 @@ def process_folder(folder, bucket, metadata_path, compress_mode="auto", dry_run=
                                                         if len(names) > DRIFT_NAMES_SHOWN else "")
         log.warning("%d file(s) in %s changed since they were archived (%s) - Freezer copies left as-is. "
                     "To re-archive them, run: %s (add --dry-run first to preview)",
-                    len(drifted), folder.name, shown, overwrite_command or "runner_archive with --overwrite")
+                    len(drifted), folder.name, shown, overwrite_command or "freezer_backup_runner with --overwrite")
         left_as_is = drifted
 
     if not new_files:

@@ -1,6 +1,6 @@
 #!/bin/python
 """
-archive_tool - manage the scrontab entries that run runner_archive.
+freezer_backup - manage the scrontab entries that run freezer_backup_runner.
 
 An entry's identity is a short hash of its absolute pattern, embedded in its
 scrontab marker: different patterns never collide, and re-running `add` for
@@ -23,11 +23,11 @@ from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
-PROGNAME = "archive_tool"
+PROGNAME = "freezer_backup"
 MARKER_PREFIX = f"# managed-by-{PROGNAME}"
 JOB_NAME_PREFIX = f"{PROGNAME}-"
 DEFAULT_SCHEDULE = "0 2 * * *"
-# Mirrored from runner_archive.py (independent commands, so not imported)
+# Mirrored from .freezer_backup_runner.py (independent commands, so not imported)
 STATE_DIR_NAME = ".freezer"
 COMPRESS_MODES = ("auto", "always", "never")
 DEFAULT_COMPRESS_MODE = "auto"
@@ -37,7 +37,7 @@ DEFAULT_RETENTION_DAYS = 730
 NOBACKUP_ROOT = "/nesi/nobackup"
 SHARED_ROOTS = ("/nesi/project", "/nesi/nobackup")  # where a non-group-writable base dir gets a warning
 # The auto-cleaner's per-project deletion candidate lists. Readable on login03
-# only, not from compute nodes - so `status` shows it, runner_archive can't use it.
+# only, not from compute nodes - so `status` shows it, freezer_backup_runner can't use it.
 AUTOCLEANER_LIST_DIR = "/search/autocleaner/filelists/current"
 
 ID_LENGTH = 6
@@ -109,18 +109,21 @@ def job_name_for(id_):
     return f"{JOB_NAME_PREFIX}{id_}"
 
 
-def directive_for(id_, mail_user=None):
+def directive_for(id_, mail_user=None, account=None):
     """
     Written above each entry's cron line, so its Slurm job can be found in
-    squeue. With `mail_user`, Slurm mails them when a run fails - i.e. logged a
-    warning (runner_archive puts those in the job comment, the mail's body).
+    squeue. With `account`, the job is charged to it rather than the user's
+    default. With `mail_user`, Slurm mails them when a run fails - i.e. logged a
+    warning (freezer_backup_runner puts those in the job comment, the mail's body).
     """
+    acct = f" --account={account}" if account else ""
     mail = f" --mail-type=FAIL --mail-user={mail_user}" if mail_user else ""
-    return f"#SCRON --job-name={job_name_for(id_)}{mail}\n"
+    return f"#SCRON --job-name={job_name_for(id_)}{acct}{mail}\n"
 
 
 DIRECTIVE_RE = re.compile(
     r"^#SCRON --job-name=" + re.escape(JOB_NAME_PREFIX) + r"(?P<id>[0-9a-f]+)"
+    r"(?: --account=(?P<account>\S+))?"
     r"(?: --mail-type=FAIL --mail-user=(?P<mail_user>\S+))?\s*$"
 )
 
@@ -188,12 +191,36 @@ def read_scrontab():
     raise RuntimeError(f"scrontab -l failed: {(proc.stderr or proc.stdout).strip()}")
 
 
+def slurm_accounts():
+    """
+    The user's Slurm accounts and their default (or None), from the controller's
+    association cache, which (unlike sacctmgr) doesn't need the accounting
+    database up. None if scontrol can't be asked.
+    """
+    user = os.environ.get("USER", "")
+    try:
+        proc = subprocess.run(["scontrol", "-o", "show", "assoc_mgr", f"users={user}", "flags=assoc"],
+                              capture_output=True, text=True)
+    except FileNotFoundError:
+        return None
+    if proc.returncode:
+        return None
+    accounts, default = {}, None  # a dict to dedupe - an account has an assoc per partition/cluster
+    for line in proc.stdout.splitlines():
+        fields = dict(f.split("=", 1) for f in line.split() if "=" in f)
+        if fields.get("UserName", "").split("(")[0] == user and fields.get("Account"):
+            accounts[fields["Account"]] = None
+            if fields.get("DefAssoc") == "Yes":
+                default = fields["Account"]
+    return list(accounts), default
+
+
 def write_scrontab(content):
     subprocess.run(["scrontab", "-"], input=content, text=True, check=True)
 
 
-def runner_archive_flags(compress_mode=None, retention_days=None, log_level=None):
-    """runner_archive flags; None/empty ones are omitted, leaving runner_archive's default."""
+def freezer_backup_runner_flags(compress_mode=None, retention_days=None, log_level=None):
+    """freezer_backup_runner flags; None/empty ones are omitted, leaving freezer_backup_runner's default."""
     flags = []
     for flag, value in (("--compress", compress_mode), ("--retention-days", retention_days),
                         ("--log-level", log_level)):
@@ -204,19 +231,19 @@ def runner_archive_flags(compress_mode=None, retention_days=None, log_level=None
 
 def manual_command(entry, flag):
     """The runner command to run by hand for a step scheduled runs only warn about (--delete-expired, --overwrite)."""
-    return shlex.join(["runner_archive", "--pattern", entry["pattern"], "--bucket", entry["bucket"],
-                       *runner_archive_flags(entry.get("compress"), retention_of(entry)), flag])
+    return shlex.join(["freezer_backup_runner", "--pattern", entry["pattern"], "--bucket", entry["bucket"],
+                       *freezer_backup_runner_flags(entry.get("compress"), retention_of(entry)), flag])
 
 
 def build_entry(schedule, pattern, bucket, compress_mode=None, retention_days=None, log_level=None):
     """The entry's cron line (add_or_update_entry() writes directive_for() above it)."""
-    flags = " ".join(runner_archive_flags(compress_mode, retention_days, log_level))
-    return (f"{schedule} runner_archive --pattern '{pattern}' --bucket {bucket} "
+    flags = " ".join(freezer_backup_runner_flags(compress_mode, retention_days, log_level))
+    return (f"{schedule} freezer_backup_runner --pattern '{pattern}' --bucket {bucket} "
             f"{flags + ' ' if flags else ''}{marker_for(entry_id(pattern))}\n")
 
 
 ENTRY_RE = re.compile(
-    r"^(?P<schedule>(?:\S+ ){4}\S+) runner_archive "
+    r"^(?P<schedule>(?:\S+ ){4}\S+) freezer_backup_runner "
     r"--pattern '(?P<pattern>[^']*)' --bucket (?P<bucket>\S+) "
     r"(?:--compress (?P<compress>\S+) )?"
     r"(?:--retention-days (?P<retention_days>\d+) )?"
@@ -226,10 +253,11 @@ ENTRY_RE = re.compile(
 
 
 def list_entries():
-    """Managed entries, parsed back out of the table (plus their cron "line", and "mail_user" from the directive)."""
+    """Managed entries, parsed back out of the table (plus their cron "line", and "mail_user"/"account" from the directive)."""
     lines = [line.strip() for line in read_scrontab().splitlines()]
-    mail_users = {m["id"]: m["mail_user"] for line in lines if (m := DIRECTIVE_RE.match(line))}
-    return [{**m.groupdict(), "mail_user": mail_users.get(m["id"]), "line": line}
+    directives = {m["id"]: m.groupdict() for line in lines if (m := DIRECTIVE_RE.match(line))}
+    no_directive = dict.fromkeys(DIRECTIVE_RE.groupindex)
+    return [{**directives.get(m["id"], no_directive), **m.groupdict(), "line": line}
             for line in lines if (m := ENTRY_RE.match(line))]
 
 
@@ -242,14 +270,14 @@ def check_id_collision(pattern):
 
 
 def add_or_update_entry(schedule, pattern, bucket, compress_mode=None, retention_days=None,
-                        log_level=None, mail_user=None):
+                        log_level=None, mail_user=None, account=None):
     """Replace this entry's own lines (directive + cron line), if any, leaving everything else as-is."""
     check_id_collision(pattern)
     id_ = entry_id(pattern)
     lines = [l for l in read_scrontab().splitlines(keepends=True) if not _is_managed_line(l, id_)]
     if lines and not lines[-1].endswith("\n"):
         lines[-1] += "\n"  # else the directive would be glued onto the last line
-    lines += [directive_for(id_, mail_user),
+    lines += [directive_for(id_, mail_user, account),
               build_entry(schedule, pattern, bucket, compress_mode, retention_days, log_level)]
     write_scrontab("".join(lines))
 
@@ -321,7 +349,7 @@ def file_records(metadata_path):
 
 
 def list_bucket_dates(bucket):
-    """{object name: LastModified date}, or None on failure. Mirrors runner_archive's list_bucket_objects()."""
+    """{object name: LastModified date}, or None on failure. Mirrors freezer_backup_runner's list_bucket_objects()."""
     proc = subprocess.run(["s3cmd", "ls", "-l", "-H", bucket_uri(bucket)], capture_output=True, text=True)
     if proc.returncode:
         return None
@@ -357,7 +385,7 @@ def retention_status(metadata_path, bucket, retention_days, bucket_cache=None):
     if objects is None:
         return None, len(deleted)
 
-    # Mirrors runner_archive's delete_expired_archives() - keep in sync.
+    # Mirrors freezer_backup_runner's delete_expired_archives() - keep in sync.
     today = datetime.now().date()
     ages = {t: (today - objects[t]).days for t in live if t in objects}
     expired = sorted((t, age) for t, age in ages.items() if age >= retention_days)
@@ -403,6 +431,7 @@ def format_status(entry, bucket_cache=None, runs=None):
         f"    schedule:    {entry['schedule']}",
         f"    compress:    {entry.get('compress') or DEFAULT_COMPRESS_MODE}",
         f"    log level:   {entry.get('log_level') or DEFAULT_LOG_LEVEL}",
+        f"    account:     {entry.get('account') or 'default'}",
         f"    mail:        {entry.get('mail_user') or 'not configured'}",
         f"    archived:    {len(file_records(metadata_path))} file(s)",
     ]
@@ -444,6 +473,8 @@ ADD_USAGE = f"""usage: {PROGNAME} add [OPTIONS]
   -r, --retention-days N warn once a tar in Freezer is this old (default 730, 0 disables);
                          `status` shows the command to delete them
   -l, --log-level LEVEL  DEBUG, INFO (default), WARNING, ERROR
+  -A, --account NAME     Slurm account (project) to run the entry under (default: your
+                         default account; asked for if you don't have one)
   -m, --mail-user EMAIL  email EMAIL when a run logs warnings or errors
   -n, --dry-run          don't change anything, just show what would happen
       --no-run           don't run the archive straight away
@@ -455,7 +486,7 @@ ADD_USAGE = f"""usage: {PROGNAME} add [OPTIONS]
 def parse_add_args(argv):
     opts = getopts(argv, "add", [
         ("p", "pattern="), ("b", "bucket="), ("c", "compress="), ("s", "schedule="), ("r", "retention-days="),
-        ("l", "log-level="), ("m", "mail-user="), ("n", "dry-run"), (None, "no-run"), ("y", "yes"), ("h", "help"),
+        ("l", "log-level="), ("A", "account="), ("m", "mail-user="), ("n", "dry-run"), (None, "no-run"), ("y", "yes"), ("h", "help"),
     ], ADD_USAGE)
     if not opts.get("-p") or not opts.get("-b"):
         die("--pattern and --bucket are required", ADD_USAGE)
@@ -465,8 +496,9 @@ def parse_add_args(argv):
         compress_mode=opts.get("-c") or None,
         schedule=opts.get("-s") or DEFAULT_SCHEDULE,
         retention_days=nonnegative_int(opts.get("-r"), "retention-days"),
-        log_level=opts["-l"].upper() if opts.get("-l") else None,  # any case, like runner_archive
+        log_level=opts["-l"].upper() if opts.get("-l") else None,  # any case, like freezer_backup_runner
         mail_user=opts.get("-m") or None,
+        account=opts.get("-A") or None,
         dry_run="-n" in opts,
         no_run="--no-run" in opts,
         yes="-y" in opts,
@@ -475,15 +507,16 @@ def parse_add_args(argv):
         die(f"--compress must be one of {COMPRESS_MODES}")
     if args.log_level not in (None, *LOG_LEVELS):
         die(f"--log-level must be one of {LOG_LEVELS}")
-    if args.mail_user and any(c.isspace() for c in args.mail_user):
-        die(f"email cannot contain whitespace, got {args.mail_user!r}")
+    for what, value in (("email", args.mail_user), ("account", args.account)):
+        if value and any(c.isspace() for c in value):
+            die(f"{what} cannot contain whitespace, got {value!r}")
     return args
 
 
 def run_archive(pattern, bucket, compress_mode, retention_days, dry_run, log_level=None):
     """Run what the entry would run, with --dry-run if previewing. Warnings print here rather than mailing."""
-    argv = ["runner_archive", "--pattern", pattern, "--bucket", bucket,
-            *runner_archive_flags(compress_mode, retention_days, log_level), *(["--dry-run"] if dry_run else [])]
+    argv = ["freezer_backup_runner", "--pattern", pattern, "--bucket", bucket,
+            *freezer_backup_runner_flags(compress_mode, retention_days, log_level), *(["--dry-run"] if dry_run else [])]
     proc = subprocess.run(argv, capture_output=True, text=True)
     if output := (proc.stdout + proc.stderr).strip():
         print(output)
@@ -499,10 +532,52 @@ def _confirm(subcommand, lines, question):
     return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
 
 
+def resolve_account(account, existing):
+    """
+    The account to write on the directive: --account if given (checked against
+    the user's accounts), else None to use their default. With no default, the
+    existing entry's account, else ask. Raises ValueError if it can't be settled.
+    """
+    known = slurm_accounts()
+    if known is None:  # can't check - leave it to scrontab
+        return account
+    accounts, default = known
+    if account:
+        if account not in accounts:
+            raise ValueError(f"you are not a member of Slurm account {account!r}"
+                             f" (yours: {', '.join(accounts) or 'none'})")
+        return account
+    if default:
+        return None
+    if existing and existing.get("account"):
+        return existing["account"]
+    if not accounts:
+        raise ValueError("you have no Slurm accounts to run the entry under")
+    if not sys.stdin.isatty():
+        raise ValueError("you have no default Slurm account, pass --account "
+                         f"(one of: {', '.join(accounts)})")
+    print("you have no default Slurm account, choose one to run the entry under:")
+    for i, name in enumerate(accounts, 1):
+        print(f"  {i}) {name}")
+    answer = input("account (number or name): ").strip()
+    if answer.isdigit() and 1 <= int(answer) <= len(accounts):
+        return accounts[int(answer) - 1]
+    if answer in accounts:
+        return answer
+    raise ValueError(f"not one of your accounts: {answer!r}")
+
+
+def _directive_summary(account, mail_user):
+    """The settings that live on the #SCRON directive, not the cron line - shown alongside it."""
+    return f"(account: {account or 'default'}, mail: {mail_user or 'none'})"
+
+
 def cmd_add(argv):
     args = parse_add_args(argv)
     try:
         validate(args.pattern, args.bucket)
+        existing = next((e for e in list_entries() if e["id"] == entry_id(args.pattern)), None)
+        account = resolve_account(args.account, existing)
     except ValueError as e:
         print(f"{PROGNAME}: {e}", file=sys.stderr)
         return 1
@@ -510,10 +585,8 @@ def cmd_add(argv):
     settings = (args.compress_mode, args.retention_days, args.log_level)
     run = partial(run_archive, args.pattern, args.bucket, args.compress_mode, args.retention_days,
                   log_level=args.log_level)
-    # the mail setting lives on the #SCRON directive, not the cron line - show it too
-    entry = (f"{build_entry(args.schedule, args.pattern, args.bucket, *settings).strip()}"
-             f" (mail: {args.mail_user or 'none'})")
-    existing = next((e for e in list_entries() if e["id"] == entry_id(args.pattern)), None)
+    entry = (f"{build_entry(args.schedule, args.pattern, args.bucket, *settings).strip()} "
+             f"{_directive_summary(account, args.mail_user)}")
 
     if args.dry_run:
         print(f"[dry-run] {'would update' if existing else 'would add'}: {entry}")
@@ -521,12 +594,13 @@ def cmd_add(argv):
         return 0
     if existing and not args.yes and not _confirm(
             "add", ["an entry already exists for this pattern:",
-                    f"  current:  {existing['line']} (mail: {existing['mail_user'] or 'none'})",
+                    f"  current:  {existing['line']} {_directive_summary(existing['account'], existing['mail_user'])}",
                     f"  new:      {entry}"], "overwrite?"):
         print(f"{PROGNAME}: aborted. No changes made.", file=sys.stderr)
         return 1
 
-    add_or_update_entry(args.schedule, args.pattern, args.bucket, *settings, mail_user=args.mail_user)
+    add_or_update_entry(args.schedule, args.pattern, args.bucket, *settings, mail_user=args.mail_user,
+                        account=account)
     state_dir = split_pattern(args.pattern)[0] / STATE_DIR_NAME
     print(f"added: {entry}\nlog:       {state_dir}/archive.log\nmetadata:  {state_dir}/metadata.jsonl")
     if not args.no_run:
