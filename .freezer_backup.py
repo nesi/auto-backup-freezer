@@ -43,7 +43,10 @@ AUTOCLEANER_LIST_DIR = "/search/autocleaner/filelists/current"
 ID_LENGTH = 6
 ID_RE = re.compile(r"^[0-9a-f]{%d}$" % ID_LENGTH)
 
-TOP_USAGE = f"""usage: {PROGNAME} <subcommand> [OPTIONS]
+TOP_USAGE = f"""
+This tool is designed to manage automatic pushes to freezer based a file pattern.
+
+usage: {PROGNAME} <subcommand> [OPTIONS]
 
 subcommands:
   add        create or update a managed archiving entry

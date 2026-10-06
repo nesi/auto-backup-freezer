@@ -2,8 +2,8 @@
 
 Automated archiving from `nobackup` to Freezer for `uoa03387`. See [SPEC.md](SPEC.md) for the design and [PLAN.md](PLAN.md) for implementation status.
 
-- `runner_archive.py` - Tool 1, the unattended archiver (runs via `scrontab`)
-- `archive_tool.py` - Tool 2, the `add`/`remove`/`status` setup CLI
+- `.freezer_backup_runner.py` - Tool 1, the unattended archiver (runs via `scrontab`)
+- `.freezer_backup.py` - Tool 2, the `add`/`remove`/`status` setup CLI
 
 ## Tests
 

@@ -64,7 +64,7 @@
 - [x] `--retention-days 0` disables retention (no warnings, nothing expires) for that entry
 - [x] Verified live: "deleted by hand" path, re-run no-op all confirmed with real `s3cmd` output
 - [ ] Verify live: warn-only summary and `--delete-expired` deletion against real `s3cmd`
-- [x] Wired into `archive_tool` (Phase 5)
+- [x] Wired into `freezer_backup` (Phase 5)
 
 ## Phase 4c,Tool 1 nobackup auto-cleaner protection
 
@@ -91,14 +91,26 @@
 - [x] Validate: folder exists/writable, Freezer access check (`s3cmd ls` on the bucket) and `775`/group perms warning, all inline in `validate()`
 - [x] Install/update `scrontab` entry (marker-tagged, idempotent),now embeds retention fields too, `ENTRY_RE` updated to match
 - [x] Print summary
-- [x] `status` command: archived count, last run, next run, retention-days, expired/deleted counts, plus the exact `runner_archive … --delete-expired` command when anything's expired (`retention_status()`, own `list_bucket_dates()`,deliberately duplicated from `runner_archive.py`, not imported, per one-file-per-command convention). Verified live.
-- [x] `add` writes a `#SCRON --job-name=archive_tool-<id>` directive above each entry; add/remove/remove --all handle it with its cron line. Older entries without it still parse
+- [x] `status` command: archived count, last run, next run, retention-days, expired/deleted counts, plus the exact `freezer_backup_runner … --delete-expired` command when anything's expired (`retention_status()`, own `list_bucket_dates()`,deliberately duplicated from `.freezer_backup_runner.py`, not imported, per one-file-per-command convention). Verified live.
+- [x] `add` writes a `#SCRON --job-name=freezer_backup-<id>` directive above each entry; add/remove/remove --all handle it with its cron line. Older entries without it still parse
 - [x] `status` "next run" from `squeue --me` (pending scron job's start time, fixed `SLURM_TIME_FORMAT`), one call for all entries; "running now", "not scheduled" (e.g. Slurm-disabled), and "unknown" (squeue unavailable) cases. `touch after` line removed. Verified live against real `squeue`
 - [x] Group-writable warning in `validate()` only for shared space (`/nesi/project`, `/nesi/nobackup`), not e.g. `/home`
 - [ ] Default schedule `0 2 * * *` actually runs at 14:00 NZST (controller is UTC). Pick a default that's intended in local time, or document it
-- [x] `--dry-run` on `add`,`run_archive(dry_run=True)` shells out to `runner_archive --dry-run` for the file-level preview plus a would-add/would-update line for the scrontab entry; writes nothing
+- [x] `--dry-run` on `add`,`run_archive(dry_run=True)` shells out to `freezer_backup_runner --dry-run` for the file-level preview plus a would-add/would-update line for the scrontab entry; writes nothing
 - [x] `validate()` Freezer-access check (distinguishes s3cmd missing / not configured / no bucket access) and 775/group-perms warning (stderr only, never fails validation)
 - [ ] Verify live: copy-paste the quoted `--delete-expired` command from `status` (with and without `--dry-run`)
+
+## Phase 5b mail
+
+- [x] `--mail-user` moved off `freezer_backup_runner` onto the entry's `#SCRON` directive (`--mail-type=FAIL --mail-user=...`); `list_entries()` reads it back from there
+- [x] `freezer_backup_runner` exits 1 iff anything was logged at WARNING+ (`MessageCollector`); lock held is now exit 0
+- [x] Messages go into the job comment (`scontrol update`, 5s pause), only under an `freezer_backup-*` job
+- [x] Comment limit found live: 1024 ok, 1025 rejected. `comment_body()` caps at 1024 bytes, 300 per message, "... and N more"
+- [x] Verified live with `sbatch` (not scrontab): comment stored, job FAILED
+- [ ] Verify live via a real `add -m` scrontab entry (multi-option `#SCRON` line), and the mail's rendering
+- [x] Drift warning names the first 3 changed files (+N more)
+- [ ] Rate limiter batches same-address FAIL mails queued together into a subjects-only mail (comments dropped). Entries on the same schedule failing together hit this - stagger schedules?
+- [ ] Only ~2 drift warnings fit in 1024 bytes since each repeats the `--overwrite` command - quote it once per run instead?
 
 ## Phase 6 tool validation
 
