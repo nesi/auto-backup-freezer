@@ -1,6 +1,6 @@
 # Manual Test Checklist
 
-Manual, on-cluster tests for `runner_archive` (Tool 1) and `archive_tool` (Tool 2), against real `s3cmd`, `scrontab` and Freezer. (!!) marks a suspected bug or an open decision.
+Manual, on-cluster tests for `freezer_backup_runner` (Tool 1) and `freezer_backup` (Tool 2), against real `s3cmd`, `scrontab` and Freezer. (!!) marks a suspected bug or an open decision.
 
 ---
 
@@ -46,7 +46,7 @@ If you do a test, please date and sign your name.
 
 ## CLI parsing (both tools)
 
-- [ ] Help (`-h`, `--help`, no args for `archive_tool`, per-subcommand help) prints usage and exits 0.
+- [ ] Help (`-h`, `--help`, no args for `freezer_backup`, per-subcommand help) prints usage and exits 0.
 - [ ] Missing required options, unknown flags and unknown subcommands give a clear error and exit 2.
 - [ ] Unsupported values for each option (`-c`, `-l`, `-r`, `-m`) are rejected with a clear message, exit 2. Valid values are accepted in any case where that makes sense (e.g. `-l debug`).
 - [ ] An unquoted, shell-expanded glob is rejected ("unexpected argument(s)"), not quietly treated as the first match.
@@ -54,9 +54,9 @@ If you do a test, please date and sign your name.
 - [ ] Bucket given with and without `s3://` is treated the same.
 - [ ] Relative patterns work, and are stored as absolute paths in scrontab entries.
 - [ ] `-m` is accepted and otherwise ignored (it's a stub).
-- [ ] Exit codes are consistent: 0 success, 1 runtime failure, 2 usage error. `runner_archive` exits 1 iff it logged any WARNING/ERROR (incl. s3cmd not configured), and 0 when the lock is held.
+- [ ] Exit codes are consistent: 0 success, 1 runtime failure, 2 usage error. `freezer_backup_runner` exits 1 iff it logged any WARNING/ERROR (incl. s3cmd not configured), and 0 when the lock is held.
 
-## `archive_tool add`
+## `freezer_backup add`
 
 Use `--no-run` for most of these, so you're testing the scrontab handling rather than archiving.
 
@@ -91,7 +91,7 @@ Use `--no-run` for most of these, so you're testing the scrontab handling rather
 - [ ] (!!) The runner still creates `.freezer/`, the lock and log lines (bumping `status`'s "last run"). Is that acceptable for "writes nothing"?
 - [ ] Dry-run while a real run holds the lock says so. (!!) At `-l WARNING` or above that message is filtered out, and the preview is empty.
 
-## `archive_tool remove`
+## `freezer_backup remove`
 
 - [ ] Removing by pattern, by id (any case) and with `--all` works. The prompt can be declined, and `-y` skips it. When non-interactive without `-y`, it refuses.
 - [ ] Only managed lines and their directives are removed. Everything else is untouched.
@@ -100,7 +100,7 @@ Use `--no-run` for most of these, so you're testing the scrontab handling rather
 - [ ] (!!) `#DISABLED` or unparseable managed lines can't be removed by `remove -p`. Document the manual fix.
 - [ ] Removing an entry leaves `.freezer/` and the Freezer tars intact.
 
-## `archive_tool status`
+## `freezer_backup status`
 
 - [ ] Shows every documented field per entry, with sensible defaults for omitted options. It filters by pattern or id, and handles unknown entries or no entries cleanly.
 - [ ] Archived and expired counts match what's actually in the bucket. (!!) After `--overwrite`, superseded records are double-counted. (!!) The spec's "pending" count isn't shown.
@@ -152,7 +152,7 @@ Use `--no-run` for most of these, so you're testing the scrontab handling rather
 - [ ] If a sibling is missing from disk, or vanishes mid-run, the old tar is kept for retention, with a warning.
 - [ ] Multiple old tars are handled independently. `-o --dry-run` previews accurately and writes nothing.
 - [ ] Note: `touch` alone counts as drift, and backdated mtimes aren't detected.
-- [ ] `archive_tool add` can't set `--overwrite`, so scheduled runs only warn. Confirm scope.
+- [ ] `freezer_backup add` can't set `--overwrite`, so scheduled runs only warn. Confirm scope.
 
 ## Touch (auto-cleaner protection)
 
@@ -160,7 +160,8 @@ Internal, not a flag on either tool. Runs only when the base dir's real path is 
 
 ```bash
 cd $REPO && /bin/python -c "
-import time; from pathlib import Path; import runner_archive as r
+import importlib.util, time; from pathlib import Path
+s = importlib.util.spec_from_file_location('r', '.freezer_backup_runner.py'); r = importlib.util.module_from_spec(s); s.loader.exec_module(r)
 r.setup_logging(Path('/dev/null'), 'INFO')
 r.touch_pending(Path('$T/a_final'), r.load_metadata(Path('$T/.freezer/metadata.jsonl')), now=time.time() + 61*86400)"
 ```
@@ -174,7 +175,7 @@ r.touch_pending(Path('$T/a_final'), r.load_metadata(Path('$T/.freezer/metadata.j
 
 ## Retention deletion
 
-**Start on day 1.** Freezer's `LastModified` can't be backdated, so use `-r 1` and wait a day. Expired tars are only warned about unless `-d` is given. `archive_tool add` can't set `-d`.
+**Start on day 1.** Freezer's `LastModified` can't be backdated, so use `-r 1` and wait a day. Expired tars are only warned about unless `-d` is given. `freezer_backup add` can't set `-d`.
 
 - [ ] Fresh tars are silent. Expired ones get one summary warning, with a copy-pasteable delete command, and `status` agrees.
 - [ ] `-d` deletes each expired tar and records it once. Dry-run previews it. The following run is a no-op.
@@ -207,7 +208,7 @@ r.touch_pending(Path('$T/a_final'), r.load_metadata(Path('$T/.freezer/metadata.j
 
 ## User environment
 
-Things users could plausibly have in their shell that might change behaviour. The main risks: `PYTHONPATH` leaking into `/bin/python` or s3cmd's `/usr/bin/python3 -s` (`-s` only drops user site), and `PATH` resolving `s3cmd`/`runner_archive`/`touch` to something else. Worth checking scheduled runs as well as manual ones.
+Things users could plausibly have in their shell that might change behaviour. The main risks: `PYTHONPATH` leaking into `/bin/python` or s3cmd's `/usr/bin/python3 -s` (`-s` only drops user site), and `PATH` resolving `s3cmd`/`freezer_backup_runner`/`touch` to something else. Worth checking scheduled runs as well as manual ones.
 
 ### Python environments
 
@@ -216,7 +217,7 @@ Things users could plausibly have in their shell that might change behaviour. Th
 - [ ] **Active conda/mamba env** (`module load Miniforge3`, `conda activate`), both base and a named env: everything works. Check whether conda's `PYTHONPATH`, `PYTHONHOME` or `LD_LIBRARY_PATH` breaks `/bin/python` or `s3cmd`.
 - [ ] **conda env that provides coreutils or its own s3cmd**: note which `touch`/`s3cmd` are picked up, and whether they behave the same.
 - [ ] **NeSI Python module loaded** (`module load Python/3.x`): same checks. Modules commonly set `PYTHONPATH` to a different Python version's site-packages.
-- [ ] **Running with a different interpreter** (`python archive_tool.py …` using a conda 3.12, or an old 3.8): either it works, or it fails with a clear message rather than an obscure one.
+- [ ] **Running with a different interpreter** (`python .freezer_backup.py …` using a conda 3.12, or an old 3.8): either it works, or it fails with a clear message rather than an obscure one.
 - [ ] **`PYTHONPATH` containing stdlib-shadowing modules** (e.g. a dir with `json.py`, `logging/`, `typing.py`, `dataclasses.py`, `tarfile.py`, as left by old backport packages): note whether either tool, or s3cmd, breaks and how obvious the error is.
 - [ ] **A `json.py` or `logging.py` in the cwd**: should be unaffected.
 - [ ] **`sitecustomize.py` / `usercustomize.py`** or `.pth` files in `~/.local/lib/python3.9/site-packages`: no effect on the tools.
@@ -224,8 +225,8 @@ Things users could plausibly have in their shell that might change behaviour. Th
 
 ### Command lookup (`PATH`)
 
-- [ ] **A stale or different `runner_archive` earlier on `PATH`** (an old copy, or a pip package with the same name): `add`'s immediate run and the scron line both call bare `runner_archive`. Note which copy runs, and whether that's acceptable, or whether the entry should use an absolute path.
-- [ ] **`archive_tool`/`runner_archive` invoked through a symlink or from another dir**: still works.
+- [ ] **A stale or different `freezer_backup_runner` earlier on `PATH`** (an old copy, or a pip package with the same name): `add`'s immediate run and the scron line both call bare `freezer_backup_runner`. Note which copy runs, and whether that's acceptable, or whether the entry should use an absolute path.
+- [ ] **`freezer_backup`/`freezer_backup_runner` invoked through a symlink or from another dir**: still works.
 - [ ] **Wrapper scripts or shell functions/aliases named `s3cmd`**, e.g. one that adds output or changes the exit code.
 
 ### Tool configuration env vars
@@ -247,13 +248,13 @@ Things users could plausibly have in their shell that might change behaviour. Th
 
 ### The scheduled job's environment
 
-- [ ] Find out which environment a scron job gets: the one active when `archive_tool add` ran (venv/conda activated), or a clean login environment. Document it, because it decides which `runner_archive`, `s3cmd` and `PYTHONPATH` the scheduled run uses.
+- [ ] Find out which environment a scron job gets: the one active when `freezer_backup add` ran (venv/conda activated), or a clean login environment. Document it, because it decides which `freezer_backup_runner`, `s3cmd` and `PYTHONPATH` the scheduled run uses.
 - [ ] Install an entry from inside an activated conda env, then deactivate it, or delete the env. The scheduled run still works.
 
 ## Scheduled runs (real `scrontab`)
 
 - [ ] With a temporary `-s "*/10 * * * *"`, the job appears in `squeue --me` under its job name, and runs to completion.
-- [ ] `runner_archive`, `s3cmd` and `~/.s3cfg` are all available inside the scron job, and `/bin/python` is ≥ 3.9 on compute nodes. See "User environment".
+- [ ] `freezer_backup_runner`, `s3cmd` and `~/.s3cfg` are all available inside the scron job, and `/bin/python` is ≥ 3.9 on compute nodes. See "User environment".
 - [ ] Find and document where the job's stdout and stderr go.
 - [ ] (!!) Only `--job-name` is set, so the job gets the default time limit, memory and account. Does a big folder hit the limit? Should `add` write `-t/--mem/-A`? Which account is charged?
 - [ ] A slow run doesn't overlap the next occurrence.
@@ -276,9 +277,9 @@ Things users could plausibly have in their shell that might change behaviour. Th
 
 ## Mail
 
-A run that logs any WARNING/ERROR exits 1, so the entry's `#SCRON ... --mail-type=FAIL --mail-user=X` mails X. Under its `archive_tool-<id>` job, `runner_archive` first puts those messages in the job comment (the mail body) and sleeps 5s.
+A run that logs any WARNING/ERROR exits 1, so the entry's `#SCRON ... --mail-type=FAIL --mail-user=X` mails X. Under its `freezer_backup-<id>` job, `freezer_backup_runner` first puts those messages in the job comment (the mail body) and sleeps 5s.
 
-Already checked with plain `sbatch` jobs (2026-09-25): `scontrol update Comment=` keeps newlines, quotes/`$`/backticks and unicode; 1024 chars is accepted, 1025+ is rejected outright ("too long", comment left empty), hence the 1024-byte cap. An end-to-end `runner_archive --dry-run` with 12 drift warnings stored a 981-byte comment (3 warnings + "... and 9 more").
+Already checked with plain `sbatch` jobs (2026-09-25): `scontrol update Comment=` keeps newlines, quotes/`$`/backticks and unicode; 1024 chars is accepted, 1025+ is rejected outright ("too long", comment left empty), hence the 1024-byte cap. An end-to-end `freezer_backup_runner --dry-run` with 12 drift warnings stored a 981-byte comment (3 warnings + "... and 9 more").
 
 - [ ] (!!) scrontab accepts several options on one `#SCRON` line (`--job-name=... --mail-type=FAIL --mail-user=...`): `add -m`, then check `scontrol show job` on the pending job shows the MailUser/MailType.
 - [ ] The mail arrives, and its body is the comment, with the line breaks intact.
