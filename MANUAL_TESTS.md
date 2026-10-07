@@ -46,7 +46,7 @@ If you do a test, please date and sign your name.
 
 ## CLI parsing (both tools)
 
-- [ ] Help (`-h`, `--help`, no args for `freezer_backup`, per-subcommand help) prints usage and exits 0.
+- [X] Help (`-h`, `--help`, no args for `freezer_backup`, per-subcommand help) prints usage and exits 0.
 - [ ] Missing required options, unknown flags and unknown subcommands give a clear error and exit 2.
 - [ ] Unsupported values for each option (`-c`, `-l`, `-r`, `-m`) are rejected with a clear message, exit 2. Valid values are accepted in any case where that makes sense (e.g. `-l debug`).
 - [ ] An unquoted, shell-expanded glob is rejected ("unexpected argument(s)"), not quietly treated as the first match.
